@@ -104,7 +104,7 @@ class DelftCommunity(Community):
         # Sign only once per round
         if r not in self.signed_rounds:
             self.signed_rounds.add(r)
-            sig = self.my_peer.key.sign(payload.nonce)
+            sig = self.my_peer.key.signature(payload.nonce)
             self.collected_sigs[r][ME_PUBLIC_KEY.hex()] = sig
 
             # Send signature to this round's submitter (if not us)
