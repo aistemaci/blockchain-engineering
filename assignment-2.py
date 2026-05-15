@@ -1,45 +1,64 @@
-import argparse
-import hashlib
-from asyncio import run, to_thread, sleep
-from dataclasses import dataclass
+import sys
 import time
+import hashlib
+import argparse
 from messages import *
-
-from ipv8.community import Community, CommunitySettings
-from ipv8.configuration import ConfigBuilder, Strategy, WalkerDefinition, default_bootstrap_defs
-from ipv8.lazy_community import lazy_wrapper
-from ipv8.messaging.payload_dataclass import DataClassPayload, type_from_format
 from ipv8.peer import Peer
-from ipv8.util import run_forever
 from ipv8_service import IPv8
-
-# change only these two lines per member 
-MY_KEY_PATH   = "../aiste_pk.pem"  # path to your private key
-MY_SUBMIT_ROUND = 1                # Aiste=1, Aykut=2, Yurian=3
+from dataclasses import dataclass
+from ipv8.util import run_forever
+from asyncio import run, to_thread, sleep
+from ipv8.lazy_community import lazy_wrapper
+from ipv8.community import Community, CommunitySettings
+from ipv8.messaging.payload_dataclass import DataClassPayload, type_from_format
+from ipv8.configuration import (
+    ConfigBuilder,
+    Strategy,
+    WalkerDefinition,
+    default_bootstrap_defs,
+)
 
 COMMUNITY_ID = bytes.fromhex("4c61623247726f75705369676e696e6732303236")
 SERVER_PUBLIC_KEY = bytes.fromhex(
     "4c69624e61434c504b3a82e33614a342774e084af80835838d6dbdb64a537d3ddb6c1d82011a7f101553cda40cf5fa0e0fc23abd0a9c4f81322282c5b34566f6b8401f5f683031e60c96"
 )
-AYKUT_PUBLIC_KEY = bytes.fromhex(
-    "4c69624e61434c504b3ad8e3c43d2221dcef7f94eb20d566afeba009e90eb999d69511ebcbf369a3303895c92c299356298f6f115c26fb14ad994347b8447ac028640344b0abc34221cd"
-)
 AISTE_PUBLIC_KEY = bytes.fromhex(
     "4c69624e61434c504b3a2513a65668a4c90fecaab284db8c782ed99a4bcab0284902e50127c9bcafda4998739097897c8ea911a9dff86f6ca2b71d3fd9086b1c4775d6bd3d5c00c818f9"
+)
+AYKUT_PUBLIC_KEY = bytes.fromhex(
+    "4c69624e61434c504b3ad8e3c43d2221dcef7f94eb20d566afeba009e90eb999d69511ebcbf369a3303895c92c299356298f6f115c26fb14ad994347b8447ac028640344b0abc34221cd"
 )
 YURIAN_PUBLIC_KEY = bytes.fromhex(
     "4c69624e61434c504b3afbc497359b4d8bc2d70fc55a3261ad831872055bd13bca87379be73cf9246e1611d4b25ac771d74cc8628d2c44c85f5de40aa9c79f2d6e9901a967063b621fc4"
 )
-MEMBER_KEYS = [AISTE_PUBLIC_KEY, AYKUT_PUBLIC_KEY, YURIAN_PUBLIC_KEY]
-ROUND_SUBMITTERS = {1: AISTE_PUBLIC_KEY, 2: AYKUT_PUBLIC_KEY, 3: YURIAN_PUBLIC_KEY}
-
 ME_PUBLIC_KEY = None
+
+
+# Parse arguments
+keyfile = sys.argv[1] if len(sys.argv) > 1 else "yurian"
 
 # Response compilations
 _ = ResponseMessage(False, "", "")
+_ = ChallengeResponseMessage(b"", 0, 0.0)
+_ = RoundResultMessage(False, 0, 0, "")
+_ = PleaseSignMessage(b"", 0)
+_ = SignedMessage(b"")
+_ = StartRoundMessage(0)
 
 # Global references
 server_peer = None
+team_peers = [None, None, None]
+team_keys = [AISTE_PUBLIC_KEY, AYKUT_PUBLIC_KEY, YURIAN_PUBLIC_KEY]
+group_id = None
+my_round = 0
+
+sig_responses = {}
+curr_round_number = 0
+
+
+async def async_input(prompt: str = "") -> str:
+    return await to_thread(input, prompt)
+
 
 class DelftCommunity(Community):
     community_id = COMMUNITY_ID
@@ -48,146 +67,176 @@ class DelftCommunity(Community):
         super().__init__(settings)
         self.add_message_handler(ResponseMessage, self.on_response)
         self.add_message_handler(ChallengeResponseMessage, self.on_challenge_response)
-        self.add_message_handler(SignatureShareMessage, self.on_signature_share)
+        self.add_message_handler(PleaseSignMessage, self.on_please_sign)
+        self.add_message_handler(SignedMessage, self.on_signed_message)
+        self.add_message_handler(RegisterPeersMessage, self.on_register_peers)
         self.add_message_handler(RoundResultMessage, self.on_round_result)
-        self.group_id = None
-        self.signed_rounds: set[int] = set()
-        self.collected_sigs: dict[int, dict] = {1: {}, 2: {}, 3: {}}
-        self.nonces: dict[int, bytes] = {}
-
-    # === HELPERS ===
-
-    def get_peer_by_key(self, pubkey: bytes) -> Peer | None:
-        for peer in self.get_peers():
-            if peer.public_key.key_to_bin() == pubkey:
-                return peer
-        return None
-
-    def request_challenge(self) -> None:
-        if self.group_id and server_peer:
-            self.ez_send(server_peer, ChallengeRequestMessage(group_id=self.group_id))
-
-    def try_submit_bundle(self, round_number: int) -> None:
-        sigs = self.collected_sigs[round_number]
-        if len(sigs) < 3:
-            return
-        sig1 = sigs.get(AISTE_PUBLIC_KEY.hex())
-        sig2 = sigs.get(AYKUT_PUBLIC_KEY.hex())
-        sig3 = sigs.get(YURIAN_PUBLIC_KEY.hex())
-        if not all([sig1, sig2, sig3]):
-            return
-        print(f"[Round {round_number}] Submitting bundle...")
-        self.ez_send(server_peer, SignatureBundleMessage(
-            group_id=self.group_id,
-            round_number=round_number,
-            sig1=sig1, sig2=sig2, sig3=sig3
-        ))
+        self.add_message_handler(StartRoundMessage, self.on_start_round)
+        self.auto_mode = False
 
     # === RESPONSE HANDLERS ===
     @lazy_wrapper(ResponseMessage)
     def on_response(self, peer: Peer, payload: ResponseMessage) -> None:
-        print(f"Response from {peer}: \n\tsuccess={payload.success}, \n\tgroup_id={payload.group_id}, \n\tmessage={payload.message}\n")
+        global group_id
+        group_id = payload.group_id
+        print(f"Group ID: {group_id}")
         if peer != server_peer:
             return
-        if payload.success:
-            self.group_id = payload.group_id
-            self.request_challenge()
+
+        payload = ChallengeRequestMessage(group_id=payload.group_id)
+        self.ez_send(server_peer, payload)
 
     @lazy_wrapper(ChallengeResponseMessage)
-    def on_challenge_response(self, peer: Peer, payload: ChallengeResponseMessage) -> None:
-        print(f"Challenge response from {peer}: \n\tnonce={payload.nonce.hex()}, \n\tround_number={payload.round_number}, \n\tdeadline={time.ctime(payload.deadline)}\n")
+    def on_challenge_response(
+        self, peer: Peer, payload: ChallengeResponseMessage
+    ) -> None:
+        global curr_round_number
+        curr_round_number = payload.round_number
         if peer != server_peer:
             return
-        r = payload.round_number
-        self.nonces[r] = payload.nonce
+        sig_responses.clear()
+        for teammate in team_peers:
+            if teammate is not None:
+                request = PleaseSignMessage(payload.nonce, curr_round_number)
+                self.ez_send(teammate, request)
+        sig_responses[ME_PUBLIC_KEY] = self.my_peer.key.signature(payload.nonce)
 
-        # Sign only once per round
-        if r not in self.signed_rounds:
-            self.signed_rounds.add(r)
-            sig = self.my_peer.key.signature(payload.nonce)
-            self.collected_sigs[r][ME_PUBLIC_KEY.hex()] = sig
+    @lazy_wrapper(PleaseSignMessage)
+    def on_please_sign(self, peer: Peer, payload: PleaseSignMessage) -> None:
+        global curr_round_number
+        signature = self.my_peer.key.signature(payload.to_sign)
+        self.ez_send(peer, SignedMessage(signature))
+        curr_round_number = payload.curr_round_number
 
-            # Send signature to this round's submitter (if not us)
-            submitter_key = ROUND_SUBMITTERS[r]
-            if submitter_key != ME_PUBLIC_KEY:
-                submitter_peer = self.get_peer_by_key(submitter_key)
-                if submitter_peer:
-                    self.ez_send(submitter_peer, SignatureShareMessage(round_number=r, signature=sig))
-                else:
-                    print(f"[Round {r}] WARNING: submitter peer not found!")
+    @lazy_wrapper(SignedMessage)
+    def on_signed_message(self, peer: Peer, payload: SignedMessage) -> None:
+        if peer.public_key.key_to_bin() in team_keys:
+            sig_responses[peer.public_key.key_to_bin()] = payload.signature
+        if len(sig_responses) == 3:
+            request = BundleSubmissionMessage(
+                group_id=group_id,
+                round_number=curr_round_number,
+                sig1=sig_responses[team_keys[0]],
+                sig2=sig_responses[team_keys[1]],
+                sig3=sig_responses[team_keys[2]],
+            )
+            self.ez_send(server_peer, request)
 
-            # Pipeline: fire next challenge immediately
-            if r < 3:
-                self.request_challenge()
-
-        # If we are the submitter, try to bundle
-        if ROUND_SUBMITTERS[r] == ME_PUBLIC_KEY:
-            self.try_submit_bundle(r)
-
-    @lazy_wrapper(SignatureShareMessage)
-    def on_signature_share(self, peer: Peer, payload: SignatureShareMessage) -> None:
-        r = payload.round_number
-        sender_key = peer.public_key.key_to_bin().hex()
-        print(f"[Round {r}] Signature received from {sender_key[:16]}...")
-        self.collected_sigs[r][sender_key] = payload.signature
-        if ROUND_SUBMITTERS[r] == ME_PUBLIC_KEY:
-            # Re-request challenge to get nonce if we don't have it yet
-            if r not in self.nonces:
-                self.request_challenge()
-            else:
-                self.try_submit_bundle(r)
+    @lazy_wrapper(RegisterPeersMessage)
+    async def on_register_peers(
+        self, peer: Peer, payload: RegisterPeersMessage
+    ) -> None:
+        await self.find_peers()
 
     @lazy_wrapper(RoundResultMessage)
     def on_round_result(self, peer: Peer, payload: RoundResultMessage) -> None:
-        if peer != server_peer:
+        print(
+            f"Round result from {peer}: \n\tsuccess={payload.success}, \n\tround_number={payload.round_number}, \n\trounds_completed={payload.rounds_completed}, \n\tmessage={payload.message}\n"
+        )
+        rn = payload.round_number
+        if self.auto_mode:
+            if payload.success and rn < 3:
+                next_submitter = team_peers[rn]  # team_peers[1]=Aykut for round2, team_peers[2]=Yurian for round3
+                if next_submitter is not None:
+                    #print(f"[Auto] Round {rn} done, triggering round {rn+1} submitter")
+                    self.ez_send(next_submitter, StartRoundMessage(round_number=rn + 1))
+                #else:
+                #print(f"[Auto] ERROR: team_peers[{rn}] is None, cannot trigger next round!")
             return
-        print(f"[Round {payload.round_number}] Result: success={payload.success}, "
-              f"rounds_completed={payload.rounds_completed}, message={payload.message}")
+        # old non-auto behavior
+        if rn < 3:
+            self.ez_send(team_peers[rn], StartRoundMessage(round_number=rn + 1))
+
+    @lazy_wrapper(StartRoundMessage)
+    async def on_start_round(self, peer: Peer, payload: StartRoundMessage) -> None:
+        if self.auto_mode:
+            rn = payload.round_number
+            submitter_key = team_keys[rn - 1]  # round1=Aiste, round2=Aykut, round3=Yurian
+            if ME_PUBLIC_KEY == submitter_key:
+                print(f"[Auto] I am round {rn} submitter - registering group with server")
+                sig_responses.clear()
+                self.ez_send(server_peer, GroupRegistrationMessage(
+                    pk1=AISTE_PUBLIC_KEY, pk2=AYKUT_PUBLIC_KEY, pk3=YURIAN_PUBLIC_KEY
+                ))
+            else:
+                print(f"[Auto] Round {rn} started, I am not the submitter - waiting for PleaseSignMessage")
+            return
+        await self.create_submission_bundle()
 
     # === MENU OPTIONS ===
-    async def create_submission_bundle(self) -> None:
-        payload = GroupRegistrationMessage(
-            pk1=AISTE_PUBLIC_KEY,
-            pk2=AYKUT_PUBLIC_KEY,
-            pk3=YURIAN_PUBLIC_KEY
-        )
-        print(server_peer)
-        self.ez_send(server_peer, payload)
+    async def request_signature(self) -> None:
+        data = (await async_input("Data:")).encode()
+        for teammate in team_peers:
+            if teammate is not None:
+                self.ez_send(teammate, PleaseSignMessage(data, curr_round_number))
 
-    async def reqest_challenge(self) -> None:
-        self.request_challenge()
+    # Round submitters: round1=Aiste, round2=Aykut, round3=Yurian.
+    # submitter: 1. registers group 2. requests challenge 3. sends PleaseSign to teammates
+    # 4. collects all 3 sigs 5. submits bundle 6.  triggers next submitter
+    # non-submitters: respond to PleaseSign automatically via on_please_sign.
+    async def start_auto_rounds(self) -> None:
+        self.auto_mode = True
+        await self.find_peers()
+        if my_round == 1:
+            #print("[Auto] I am round 1 submitter - registering group with server")
+            sig_responses.clear()
+            self.ez_send(server_peer, GroupRegistrationMessage(
+                pk1=AISTE_PUBLIC_KEY, pk2=AYKUT_PUBLIC_KEY, pk3=YURIAN_PUBLIC_KEY
+            ))
+        #else:
+        #    print(f"[Auto] I am round {my_round} submitter - waiting for my round to start")
+
+    async def create_submission_bundle(self) -> None:
+        await self.find_peers()
+        if curr_round_number == 0 and my_round != 1:
+            for teammate in team_peers:
+                if teammate is not None:
+                    self.ez_send(teammate, RegisterPeersMessage())
+            await sleep(1)
+            self.ez_send(
+                team_peers[0],
+                StartRoundMessage(round_number=1),
+            )
+            return
+        payload = GroupRegistrationMessage(
+            pk1=AISTE_PUBLIC_KEY, pk2=AYKUT_PUBLIC_KEY, pk3=YURIAN_PUBLIC_KEY
+        )
+        self.ez_send(server_peer, payload)
 
     async def get_my_key(self) -> None:
         print(self.my_peer.key.pub().key_to_bin().hex(), "\n")
 
     async def find_peers(self) -> None:
+        global server_peer
         print(f"=== Peers {len(self.get_peers())} === {time.ctime()} ===")
         for peer in self.get_peers():
             print(peer, peer.public_key.key_to_bin().hex())
+            for i in range(3):
+                if (
+                    peer.public_key.key_to_bin() == team_keys[i]
+                    and team_peers[i] is None
+                ):
+                    team_peers[i] = peer
+                    print(f"Found teammate {i+1}: {peer}")
+                if (
+                    peer.public_key.key_to_bin() == SERVER_PUBLIC_KEY
+                    and server_peer is None
+                ):
+                    server_peer = peer
+                    print(f"Found server: {server_peer}")
         print("\n")
-
 
     # Starting function
     async def started(self) -> None:
-        global ME_PUBLIC_KEY, server_peer
+        global ME_PUBLIC_KEY, server_peer, my_round
         ME_PUBLIC_KEY = self.my_peer.key.pub().key_to_bin()
+        my_round = team_keys.index(ME_PUBLIC_KEY) + 1
 
-        attempts = 0
-        while server_peer is None:
-            await sleep(0.1)
-            for peer in self.get_peers():
-                if peer.public_key.key_to_bin() == SERVER_PUBLIC_KEY:
-                    server_peer = peer
-                    print(f"Found server peer: {server_peer} after {attempts} attempts")
-                    break
-            attempts += 1
-            if attempts % 50 == 0:
-                print(f"{attempts} attempts")
-    
 
 async def start_client() -> None:
+    global server_peer
     builder = ConfigBuilder().clear_keys().clear_overlays()
-    builder.add_key("client", "curve25519", MY_KEY_PATH)
+    builder.add_key("client", "curve25519", f"../{keyfile}.pem")
     builder.add_overlay(
         "DelftCommunity",
         "client",
@@ -196,8 +245,8 @@ async def start_client() -> None:
         {},
         [("started",)],
     )
-    ipv8_instance = IPv8(builder.finalize(),
-        extra_communities={"DelftCommunity": DelftCommunity}
+    ipv8_instance = IPv8(
+        builder.finalize(), extra_communities={"DelftCommunity": DelftCommunity}
     )
     await ipv8_instance.start()
 
@@ -208,15 +257,28 @@ async def start_client() -> None:
             community = overlay
             break
 
+    attempts = 0
+    while server_peer is None:
+        attempts += 1
+        await sleep(1)
+        for peer in community.get_peers():
+            if peer.public_key.key_to_bin() == SERVER_PUBLIC_KEY:
+                server_peer = peer
+                print(f"Found server peer: {server_peer} after {attempts} attempts")
+                break
+        if server_peer is None:
+            print(f"{attempts} attempts: {len(community.get_peers())} peers")
+
     # Main menu loop
     while True:
         print("1. Get my public key")
         print("2. Find peers")
         print("3. Create submission bundle")
-        print("4. Start rounds")
+        print("4. Request signature")
+        print("5. Auto rounds (submitter-based)")
         choice = 2
         try:
-            choice = int(input(""))
+            choice = int(await async_input(""))
         except:
             pass
         match choice:
@@ -227,8 +289,10 @@ async def start_client() -> None:
             case 3:
                 await community.create_submission_bundle()
             case 4:
-                await community.reqest_challenge()
-            case _: 
+                await community.request_signature()
+            case 5:
+                await community.start_auto_rounds()
+            case _:
                 exit(0)
         await sleep(1)
 
