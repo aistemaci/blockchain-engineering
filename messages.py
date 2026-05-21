@@ -1,72 +1,86 @@
 from dataclasses import dataclass
+from custom_types import *
 from ipv8.messaging.payload_dataclass import DataClassPayload
 
 
+# === DELFT COMMUNITY MESSAGES ===
 @dataclass
-class GroupRegistrationMessage(DataClassPayload[1]):
-    pk1: bytes
-    pk2: bytes
-    pk3: bytes
-
-
-@dataclass
-class ResponseMessage(DataClassPayload[2]):
-    success: bool
+class RegisterBlockchainRequest(DataClassPayload[1]):
     group_id: str
+    community_id: bytes
+
+
+@dataclass
+class RegisterBlockchainResponse(DataClassPayload[2]):
+    success: bool
     message: str
 
 
+# === BLOCKCHAIN COMMUNITY MESSAGES ===
 @dataclass
-class ChallengeRequestMessage(DataClassPayload[3]):
-    group_id: str
-
-
-@dataclass
-class ChallengeResponseMessage(DataClassPayload[4]):
-    nonce: bytes
-    round_number: int
-    deadline: float
-
-
-@dataclass
-class BundleSubmissionMessage(DataClassPayload[5]):
-    group_id: str
-    round_number: int
-    sig1: bytes
-    sig2: bytes
-    sig3: bytes
-
-
-@dataclass
-class RoundResultMessage(DataClassPayload[6]):
-    success: bool
-    round_number: int
-    rounds_completed: int
-    message: str
-
-
-@dataclass
-class PleaseSignMessage(DataClassPayload[7]):
-    to_sign: bytes
-    curr_round_number: int
-
-
-@dataclass
-class SignedMessage(DataClassPayload[8]):
+class SubmitTransactionRequest(DataClassPayload[1]):
+    sender_key: bytes
+    data: bytes
+    timestamp: int
     signature: bytes
 
 
 @dataclass
-class StartRoundMessage(DataClassPayload[9]):
-    round_number: int
+class SubmitTransactionResponse(DataClassPayload[2]):
+    success: bool
+    tx_hash: bytes
+    message: str
 
 
 @dataclass
-class RegisterPeersMessage(DataClassPayload[10]):
-    pass
+class GetChainHeigthRequest(DataClassPayload[3]):
+    request_id: int
 
 
 @dataclass
-class SignatureShareMessage(DataClassPayload[11]):
-    round_number: int
-    signature: bytes
+class GetChainHeigthResponse(DataClassPayload[4]):
+    request_id: int
+    height: int
+    tip_hash: bytes
+
+
+@dataclass
+class GetBlockRequest(DataClassPayload[5]):
+    height: int
+
+
+@dataclass
+class GetBlockResponse(DataClassPayload[6]):
+    height: int
+    prev_hash: bytes
+    txs_hash: bytes
+    timestamp: int
+    difficulty: int
+    nonce: int
+    block_hash: bytes
+    tx_hashes: bytes
+
+
+@dataclass
+class BlockAnnouncementMessage(DataClassPayload[7]):
+    height: int
+    block: bytes
+
+
+@dataclass
+class ChangedDifficultyMessage(DataClassPayload[8]):
+    new_difficulty: int
+
+
+@dataclass
+class EntireChainRequest(DataClassPayload[9]):
+    request_id: int
+    height: int
+
+
+@dataclass
+class EntireChainResponse(DataClassPayload[10]):
+    request_id: int
+    total_height: int
+    height: int
+    block: bytes
