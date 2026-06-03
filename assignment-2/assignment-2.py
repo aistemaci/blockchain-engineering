@@ -236,7 +236,7 @@ class DelftCommunity(Community):
 async def start_client() -> None:
     global server_peer
     builder = ConfigBuilder().clear_keys().clear_overlays()
-    builder.add_key("client", "curve25519", f"../{keyfile}.pem")
+    builder.add_key("client", "curve25519", f"../private_keys/{keyfile}.pem")
     builder.add_overlay(
         "DelftCommunity",
         "client",
